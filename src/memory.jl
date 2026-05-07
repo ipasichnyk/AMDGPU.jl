@@ -8,7 +8,9 @@ function info()
     free_ref = Ref{Csize_t}()
     total_ref = Ref{Csize_t}()
     HIP.hipMemGetInfo(free_ref, total_ref)
-    return convert(Int, free_ref[]), convert(Int, total_ref[])
+    f = free_ref[] % Int
+    t = total_ref[] % Int
+    return max(f, 0), max(t, 0)
 end
 
 """
@@ -401,6 +403,43 @@ function pool_status(io::IO=stdout)
         end
         println(io, join(parts, ", "))
     end
+end
+
+"""
+    memory_snapshot([io=stdout]; label=nothing, sync=true)
+
+Print a synchronized snapshot of device and pool memory state.
+Use this for debugging memory behavior at semantic boundaries
+instead of sampling during asynchronous allocations.
+"""
+function memory_snapshot(io::IO=stdout; label=nothing, sync::Bool=true)
+    sync && HIP.device_synchronize()
+
+    free_bytes, total_bytes = info()
+    used_bytes = total_bytes - free_bytes
+
+    pool = Mem.pool_create(AMDGPU.device())
+    pool_used = HIP.used_memory(pool)
+    pool_reserved = HIP.reserved_memory(pool)
+    non_pool = max(0, used_bytes - pool_reserved)
+
+    isnothing(label) || println(io, "Memory snapshot: $label")
+    @printf(io, "Device used: %s / %s (free: %s)\n",
+            Base.format_bytes(used_bytes),
+            Base.format_bytes(total_bytes),
+            Base.format_bytes(free_bytes))
+    @printf(io, "Pool used: %s, pool reserved: %s, non-pool: %s\n",
+            Base.format_bytes(pool_used),
+            Base.format_bytes(pool_reserved),
+            Base.format_bytes(non_pool))
+    return (;
+        device_used = used_bytes,
+        device_free = free_bytes,
+        device_total = total_bytes,
+        pool_used = Int(pool_used),
+        pool_reserved = Int(pool_reserved),
+        non_pool = Int(non_pool),
+    )
 end
 
 
