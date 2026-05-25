@@ -536,6 +536,16 @@ end
 
 # Level 3
 ## (GE) general matrix-matrix multiplication
+
+# Per-GEMM ROCTX instrumentation (diagnostic only).
+# Enable with AMDGPU_ROCTX_GEMM=1 before starting Julia.
+# Set AMDGPU_ROCTX_LIB to the path of libroctx_shim.so (roctxRangePush is an inline
+# in the SDK header; the shim resolves it at C compile time into a real exported symbol).
+# Zero overhead when unset — the const is evaluated once at module load.
+const _roctx_gemm_enabled = parse(Bool, get(ENV, "AMDGPU_ROCTX_GEMM", "false"))
+const _roctx_gemm_lib     = get(ENV, "AMDGPU_ROCTX_LIB", "")
+const _roctx_gemm_seq     = Ref{Int}(0)
+
 for (fname, elty) in (
     (:rocblas_dgemm,:Float64),
     (:rocblas_sgemm,:Float32),
@@ -560,8 +570,16 @@ for (fname, elty) in (
             ldb = max(1, stride(B, 2))
             ldc = max(1, stride(C, 2))
             (; handle, stream) = lib_state()
+            if _roctx_gemm_enabled && !isempty(_roctx_gemm_lib)
+                _seq   = (_roctx_gemm_seq[] += 1)
+                _label = "gemm#$(_seq) $($(string(elty))) M=$(m) K=$(k) N=$(n)"
+                ccall((:roctx_push, _roctx_gemm_lib), Cvoid, (Cstring,), _label)
+            end
             $(fname)(handle, transA, transB,
                      m, n, k, Ref(alpha), A, lda, B, ldb, Ref(beta), C, ldc)
+            if _roctx_gemm_enabled && !isempty(_roctx_gemm_lib)
+                ccall((:roctx_pop, _roctx_gemm_lib), Cvoid, ())
+            end
             C
         end
         function gemm(

@@ -643,6 +643,14 @@ for elty in (:Float32, :Float64, :ComplexF32, :ComplexF64)
         LinearAlgebra.LAPACK.orgqr!(A::ROCMatrix{$elty}, tau::ROCVector{$elty}) = rocSOLVER.orgqr!(A, tau)
         LinearAlgebra.LAPACK.gebrd!(A::ROCMatrix{$elty}) = rocSOLVER.gebrd!(A)
         LinearAlgebra.LAPACK.gesvd!(jobu::Char, jobvt::Char, A::ROCMatrix{$elty}) = rocSOLVER.gesvd!(jobu, jobvt, A)
+
+        # Julia 1.13+ restricts svd!/svd! to StridedMatrix, breaking the LAPACK.gesvd!
+        # dispatch for ROCMatrix. Override svd! directly so svd(::ROCMatrix; alg) works.
+        function LinearAlgebra.svd!(A::ROCMatrix{$elty}; full::Bool=false, alg::LinearAlgebra.Algorithm=LinearAlgebra.default_svd_alg(A), atol::Real=0, rtol::Real=0)
+            c = full ? 'A' : 'S'
+            u, s, vt = LAPACK.gesvd!(c, c, A)
+            LinearAlgebra.SVD(u, s, vt)
+        end
     end
 end
 

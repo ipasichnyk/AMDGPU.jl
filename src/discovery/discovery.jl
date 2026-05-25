@@ -25,6 +25,8 @@ function get_ld_lld(rocm_path::String)::Tuple{String, Bool}
 end
 
 function get_device_libs(from_artifact::Bool; rocm_path::String)
+    hip_devlibs_path = get(ENV, "HIP_DEVICE_LIB_PATH", "")
+    hip_devlibs_path != "" && return hip_devlibs_path
     if from_artifact && ROCmDeviceLibs_jll.is_available()
         ROCmDeviceLibs_jll.bitcode_path
     else
