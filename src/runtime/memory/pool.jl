@@ -37,6 +37,7 @@ mutable struct BinnedPool
     device::HIPDevice
     total_allocated::Int
     overflow_count::Int            # allocations > _bin_ceiling() (fell through to HIP pool)
+    lock::Base.Threads.SpinLock    # serialize freelist mutations (multi-stream / finalizers)
 end
 
 function _bin_index(bytesize::Int)
@@ -50,7 +51,30 @@ end
 function BinnedPool(dev::HIPDevice = AMDGPU.device())
     bins = [_Bin(_MIN_BIN_SIZE * (1 << (i - 1)), Ptr{Cvoid}[], Ptr{Cvoid}[], 0)
             for i in 1:_NUM_BINS]
-    BinnedPool(bins, dev, 0, 0)
+    BinnedPool(bins, dev, 0, 0, Base.Threads.SpinLock())
+end
+
+# Serialize freelist mutations AND prevent finalizers from re-entering pool
+# operations on the running task. ROCArray finalizers call `pool_free!` at GC
+# safepoints on arbitrary tasks/threads; without this a free can resize a bin's
+# freelist while an `alloc!`/`_grow_bin!` (on another thread, or reentrantly on
+# the same task) is mutating it -> ConcurrencyViolationError.
+#
+# A non-yielding SpinLock (not a ReentrantLock) is deliberate: `GC.enable_finalizers`
+# maintains a per-thread counter, so the enable/disable pair must run on the same
+# thread. A yielding lock could migrate the task between them (counter imbalance)
+# and, being reentrant, would still let a finalizer re-acquire it on the same task
+# and resize the freelist. Disabling finalizers before spinning guarantees no
+# finalizer runs on this thread while we hold the lock; other threads block on it.
+@inline function _with_pool_lock(f, pool::BinnedPool)
+    GC.enable_finalizers(false)
+    lock(pool.lock)
+    try
+        return f()
+    finally
+        unlock(pool.lock)
+        GC.enable_finalizers(true)
+    end
 end
 
 function _grow_bin!(pool::BinnedPool, bin::_Bin)
@@ -78,18 +102,22 @@ freed; the caller must return the slot via `pool_free!(pool, buf)`.
 """
 function alloc!(pool::BinnedPool, bytesize::Int)
     if bytesize > _bin_ceiling()
-        pool.overflow_count += 1
+        _with_pool_lock(pool) do
+            pool.overflow_count += 1
+        end
         return nothing
     end
     bytesize == 0 && return HIPBuffer(C_NULL, 0; own=false)
 
-    idx = _bin_index(bytesize)
-    bin = pool.bins[idx]
-    isempty(bin.freelist) && _grow_bin!(pool, bin)
+    return _with_pool_lock(pool) do
+        idx = _bin_index(bytesize)
+        bin = pool.bins[idx]
+        isempty(bin.freelist) && _grow_bin!(pool, bin)   # called with lock held
 
-    bin.alloc_count += 1
-    ptr = pop!(bin.freelist)   # O(1) — no HIP call
-    return HIPBuffer(ptr, bytesize; own=false)
+        bin.alloc_count += 1
+        ptr = pop!(bin.freelist)   # O(1) — no HIP call
+        HIPBuffer(ptr, bytesize; own=false)
+    end
 end
 
 """
@@ -104,7 +132,10 @@ function pool_free!(pool::BinnedPool, buf::HIPBuffer)
     buf.bytesize > _bin_ceiling() && return  # large bufs are owned by HIP pool
 
     idx = _bin_index(buf.bytesize)
-    push!(pool.bins[idx].freelist, buf.ptr)  # O(1) — no HIP call
+    _with_pool_lock(pool) do
+        push!(pool.bins[idx].freelist, buf.ptr)  # O(1) — no HIP call
+    end
+    return
 end
 
 """
@@ -114,14 +145,16 @@ Free all hipMalloc'd slabs. Must be called after stream synchronization
 ensures no GPU work is still using pool memory.
 """
 function destroy!(pool::BinnedPool)
-    for bin in pool.bins
-        for slab in bin.slabs
-            HIP.hipFree(slab)
+    _with_pool_lock(pool) do
+        for bin in pool.bins
+            for slab in bin.slabs
+                HIP.hipFree(slab)
+            end
+            empty!(bin.slabs)
+            empty!(bin.freelist)
         end
-        empty!(bin.slabs)
-        empty!(bin.freelist)
+        pool.total_allocated = 0
     end
-    pool.total_allocated = 0
 end
 
 function Base.show(io::IO, pool::BinnedPool)

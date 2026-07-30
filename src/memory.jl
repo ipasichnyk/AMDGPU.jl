@@ -449,9 +449,13 @@ mutable struct Managed{M}
     stream::HIPStream
     dirty::Bool
     captured::Bool
+    # Owning binned pool (if this buffer was sub-allocated from one). Recorded at
+    # alloc time so `pool_free` returns the slot to the pool that OWNS it rather
+    # than the current task's pool — finalizers run on arbitrary tasks/threads.
+    pool::Union{Nothing, Mem.BinnedPool}
 
-    function Managed(mem; stream=AMDGPU.stream(), dirty=true, captured=false)
-        new{typeof(mem)}(mem, stream, dirty, captured)
+    function Managed(mem; stream=AMDGPU.stream(), dirty=true, captured=false, pool=nothing)
+        new{typeof(mem)}(mem, stream, dirty, captured, pool)
     end
 end
 
@@ -541,7 +545,7 @@ function pool_alloc(::Type{B}, bytesize) where B
         buf = Mem.alloc!(bp, bytesize)
         if buf !== nothing
             s = AMDGPU.stream()
-            return Managed(buf; stream=s, captured=AMDGPU.is_capturing())
+            return Managed(buf; stream=s, captured=AMDGPU.is_capturing(), pool=bp)
         end
         # buf === nothing means bytesize > BIN_CEILING — fall through to HIP pool
     end
@@ -569,8 +573,12 @@ function pool_free(managed::Managed{M}) where M
     sz = Int(sizeof(managed.mem))
     sz == 0 && return
 
-    # Fast path: return slot to binned pool (zero HIP calls)
-    bp = _get_binned_pool()
+    # Fast path: return slot to the binned pool that OWNS this buffer (recorded
+    # at alloc time). Routing by owner — not the current task's pool — is
+    # required because ROCArray finalizers run on arbitrary tasks/threads: using
+    # `_get_binned_pool()` here would push the slot into whatever pool happens to
+    # be active on the finalizing task, corrupting/racing another pool's freelist.
+    bp = managed.pool
     if bp !== nothing && !managed.mem.own
         Mem.pool_free!(bp, managed.mem)
         return
