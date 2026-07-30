@@ -117,7 +117,7 @@ function library_state(
         finalizer(current_task()) do task
             push!(idle_handles, tls.context, new_handle) do
                 context!(tls.context) do
-                    destroy_handle!(new_handle)
+                    destroy_handle(new_handle)
                 end
             end
         end
